@@ -148,10 +148,15 @@ def notice(msg, type_='success'):
 
 def layout(title, body, user=None, refresh=False):
     nav = ''
+    pending_notifications = 0
+    if user and user['role'] == 'faculty':
+        with connect() as ncx:
+            pending_notifications = ncx.execute("SELECT COUNT(*) FROM claims WHERE stage='faculty' AND status='pending'").fetchone()[0]
     if user:
         nav = f'''<nav><a href="/">Dashboard</a> <a href="/claims">Claims</a>'''
         if user['role']=='student': nav += ' <a href="/new">Submit Claim</a>'
         if user['role']=='admin': nav += ' <a href="/admin">Administration</a>'
+        if user['role']=='faculty': nav += f' <a class="notification-link" href="/notifications" aria-label="Notifications: {pending_notifications} claims waiting">&#128276; Notifications <span class="notification-count">{pending_notifications}</span></a>'
         nav += f'''<span class="right">{esc(user['name'])} ({esc(ROLE_LABEL[user['role']])})
           <form method="post" action="/logout" class="inline"><input type="hidden" name="csrf" value="{esc(user['csrf'])}"><button class="linkbutton">Sign out</button></form></span></nav>'''
     else:
@@ -165,10 +170,10 @@ def layout(title, body, user=None, refresh=False):
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>{esc(title)} | Reimbursement Tracker Demo</title>
       <link rel="stylesheet" href="/static/style.css"></head>
-      <body><header><div class="container"><strong>Club Reimbursement Tracker</strong>
-        <span class="subtitle">Academic Demonstration · Fictional Data</span></div></header>
-        <div class="container">{nav}<main><h1>{esc(title)}</h1>{body}</main>
-        <footer>Local academic prototype. No official IIT Madras systems or real payments are connected.</footer></div>
+      <body><header><div class="container header-inner"><div class="brand-mark">R</div><div class="brand-copy"><strong>Club Reimbursement Tracker</strong>
+        <span class="subtitle">A simpler way to track every approval</span></div><span class="demo-pill">DEMO ENVIRONMENT</span></div></header>
+        <div class="container">{nav}<main><div class="page-heading"><div><p class="eyebrow">REIMBURSEMENT PORTAL</p><h1>{esc(title)}</h1></div></div>{body}</main>
+        <footer>Academic prototype with fictional information. No official IIT Madras systems or real payments are connected.</footer></div>
         {reload_script}</body></html>'''
 
 
@@ -229,6 +234,86 @@ def claim_table(rows):
           <td>{badge(row)}</td><td>{esc(row['updated_at'][:16])}</td></tr>''')
     parts.append('</tbody></table></div>')
     return ''.join(parts)
+
+
+def progress_tracker(claim, compact=False):
+    """Show true stage state; returned/rejected cases are not represented as completed."""
+    steps = [('Submitted','submitted'), ('Faculty Advisor','faculty'),
+             ('Department','department'), ('Accounts','accounts'), ('Paid','payment')]
+    order = {'faculty':1, 'department':2, 'accounts':3, 'payment':4}
+    position = order.get(claim['stage'], 1)
+    end_state = claim['status']
+    parts = ['<div class="progress-track'+(' compact' if compact else '')+'" aria-label="Reimbursement progress">']
+    for idx, (label, stage) in enumerate(steps):
+        if end_state == 'paid': state = 'complete'
+        elif idx == 0 or idx < position: state = 'complete'
+        elif idx == position and end_state == 'pending': state = 'active'
+        elif idx == position and end_state in ('returned','rejected'): state = 'stopped'
+        else: state = 'upcoming'
+        symbol = '&#10003;' if state == 'complete' else str(idx + 1)
+        parts.append(f'<div class="progress-step {state}"><span class="progress-dot">{symbol}</span><span class="progress-caption">{esc(label)}</span></div>')
+    parts.append('</div>')
+    if not compact and end_state in ('returned','rejected'):
+        parts.append(f'<p class="progress-note">This claim is {esc(status_label(claim).lower())}. The approval flow is paused or stopped.</p>')
+    return ''.join(parts)
+
+
+def student_cards(cx, user):
+    counts = cx.execute("""SELECT COUNT(*) AS total,
+       SUM(CASE WHEN status='pending' AND stage!='payment' THEN 1 ELSE 0 END) AS pending,
+       SUM(CASE WHEN status='pending' AND stage='payment' THEN 1 ELSE 0 END) AS approved,
+       SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END) AS reimbursed
+       FROM claims WHERE student_id=?""", (user['id'],)).fetchone()
+    cards = [('Total Claims',counts['total'] or 0,'all'),
+             ('Pending Approval',counts['pending'] or 0,'pending'),
+             ('Approved',counts['approved'] or 0,'approved'),
+             ('Reimbursed',counts['reimbursed'] or 0,'paid')]
+    return '<section class="summary-grid" aria-label="Claim overview">'+''.join(
+        f'<div class="summary-card {kind}"><span>{esc(label)}</span><strong>{value}</strong></div>'
+        for label,value,kind in cards)+'</section>'
+
+
+def empty_dashboard():
+    return """<section class="empty-state dashboard-empty">
+      <div class="empty-illustration" aria-hidden="true">&#128196;</div>
+      <h2>No reimbursement claims yet</h2>
+      <p>Submit your first claim to receive a tracking ID and follow each approval stage in one place.</p>
+      <a href="/new" class="button">Create First Claim &rarr;</a>
+    </section>"""
+
+
+def demo_login_buttons():
+    if not DEMO_MODE: return ''
+    buttons=[]
+    for role,label in [('student','Student'),('faculty','Faculty Advisor')]:
+        buttons.append(f'<form method="post" action="/demo-login" class="demo-login-form"><input type="hidden" name="role" value="{role}"><button type="submit" class="button secondary">Continue as {label} &rarr;</button></form>')
+    return '<section class="quick-login"><div><h2>Quick login for the video</h2><p>Fictional demo accounts only. Choose a role to enter without typing a password.</p></div><div class="quick-login-actions">'+''.join(buttons)+'</div></section>'
+
+
+def confirmation_screen(claim, kind):
+    cid = display_id(claim['id'])
+    if kind == 'submitted':
+        title='Claim submitted successfully!'
+        intro='Your reimbursement request is saved and has been sent to the Faculty Advisor for review.'
+        when_label='Submission date'
+        timestamp=claim['created_at']
+        next_label='Faculty Advisor Pending' if claim['stage']=='faculty' and claim['status']=='pending' else status_label(claim)
+        cta='Track My Claim'
+    else:
+        title='Claim approved successfully!'
+        intro='Faculty Advisor approval has been recorded. The claim has moved to the Department for the next review.'
+        when_label='Last updated'
+        timestamp=claim['updated_at']
+        next_label=status_label(claim)
+        cta='View Claim &amp; Timeline'
+    return f"""<section class="confirmation-card"><div class="success-emblem" aria-hidden="true">&#10003;</div>
+      <h2>{title}</h2><p>{intro}</p>
+      <dl class="confirmation-details"><div><dt>Claim ID</dt><dd>{cid}</dd></div>
+      <div><dt>Amount requested</dt><dd>{rupees(claim['amount_paise'])}</dd></div>
+      <div><dt>{when_label}</dt><dd>{esc(timestamp)}</dd></div>
+      <div><dt>Current status</dt><dd>{esc(next_label)}</dd></div></dl>
+      <a class="button" href="/claim/{claim['id']}">{cta} &rarr;</a>
+      <a class="text-link" href="/">Back to dashboard</a></section>"""
 
 
 def timeline(cx, claim):
@@ -314,7 +399,19 @@ class Handler(BaseHTTPRequestHandler):
                 <tr><td>Accounts</td><td>accounts@demo.local</td><td>Accounts123!</td></tr>
                 <tr><td>Treasurer (read-only for club peers)</td><td>treasurer@demo.local</td><td>Treasurer123!</td></tr>
                 <tr><td>Administrator</td><td>admin@demo.local</td><td>Admin123!</td></tr></table></div>'''
-                return self.send_page('Sign in',login)
+                return self.send_page('Sign in',demo_login_buttons()+login)
+            if path=='/notifications':
+                if user['role']!='faculty':
+                    return self.send_page('Access denied',notice('Only the Faculty Advisor can see these notifications.','error'),user,403)
+                pending=cx.execute("""SELECT c.*, u.name submitter FROM claims c JOIN users u ON c.student_id=u.id
+                    WHERE c.stage='faculty' AND c.status='pending' ORDER BY c.created_at DESC,c.id DESC""").fetchall()
+                if pending:
+                    alert=f'<div class="notification-banner"><div class="alert-icon">&#128276;</div><div><strong>{len(pending)} claim(s) waiting for your review</strong><p>Open a claim below to review its receipt and approve, return or reject it.</p></div></div>'
+                    cards=''.join(f'<a class="notification-card" href="/claim/{c["id"]}"><span class="notification-dot"></span><span><strong>New reimbursement request · {display_id(c["id"])}</strong><small>{esc(c["submitter"])} · {esc(c["club"])} · {rupees(c["amount_paise"])} · {esc(c["created_at"][:16])}</small></span><span class="notification-arrow">Review &rarr;</span></a>' for c in pending)
+                    body=alert+f'<div class="notification-list">{cards}</div>'
+                else:
+                    body='<div class="empty-state"><span class="empty-icon">&#10003;</span><h2>All caught up!</h2><p>No reimbursement claims currently require Faculty Advisor approval.</p><a class="button secondary" href="/">Back to dashboard</a></div>'
+                return self.send_page('Notifications',body,user,refresh=True)
             if path in ('/', '/claims'):
                 query = urllib.parse.parse_qs(url.query)
                 clauses=[];params=[]
@@ -335,7 +432,20 @@ class Handler(BaseHTTPRequestHandler):
                 heading = 'My claims' if user['role']=='student' else ('Pending approvals' if path=='/' and user['role'] in ROLE_ORDER else 'All claims')
                 if user['role']=='admin':heading='All claims'
                 summary=f'<p>Logged in as <strong>{esc(user["name"])}</strong>. {esc(ROLE_LABEL[user["role"]])} view.</p>'
-                if user['role']=='student': summary+='<p><a class="button" href="/new">Submit new reimbursement</a></p>'
+                if user['role']=='student':
+                    summary += student_cards(cx,user)
+                    if path=='/' and rows:
+                        summary += '<section class="latest-progress"><div class="section-header"><div><h2>Latest claim progress</h2><p>'+esc(display_id(rows[0]['id']))+' · '+esc(rows[0]['purpose'])+'</p></div><a class="button secondary" href="/claim/'+str(rows[0]['id'])+'">View Claim</a></div>'+progress_tracker(rows[0])+'</section>'
+                    if path=='/' and not rows:
+                        summary += empty_dashboard()
+                    else:
+                        summary += '<p><a class="button" href="/new">+ Submit new reimbursement</a></p>'
+                if user['role']=='faculty' and path=='/':
+                    count=cx.execute("SELECT COUNT(*) FROM claims WHERE stage='faculty' AND status='pending'").fetchone()[0]
+                    if count:
+                        summary+=f'<div class="notification-banner"><div class="alert-icon">&#128276;</div><div><strong>{count} new reimbursement claim(s) need your approval</strong><p>Students have submitted claims awaiting Faculty Advisor review. <a href="/notifications">View notifications &rarr;</a></p></div></div>'
+                    else:
+                        summary+='<div class="notification-banner quiet"><div class="alert-icon">&#10003;</div><div><strong>You are all caught up</strong><p>There are no claims awaiting your approval.</p></div></div>'
                 if user['role']=='admin':
                     total=cx.execute('SELECT COUNT(*) FROM claims').fetchone()[0]
                     pending=cx.execute("SELECT COUNT(*) FROM claims WHERE status='pending'").fetchone()[0]
@@ -343,12 +453,23 @@ class Handler(BaseHTTPRequestHandler):
                 if path=='/claims':
                     summary+='''<form method="get" class="filters"><label>Claim ID <input name="q" placeholder="RMB-0001"></label>
                     <label>Status <select name="status"><option value="">All</option><option value="pending">Pending</option><option value="returned">Returned</option><option value="rejected">Rejected</option><option value="paid">Paid</option></select></label><button>Filter</button></form>'''
-                summary+=claim_table(rows)
+                if not (user['role']=='student' and path=='/' and not rows): summary+=claim_table(rows)
                 if user['role'] in ROLE_ORDER and path=='/':summary+='<p><a href="/claims">View all claims</a></p>'
                 return self.send_page(heading,summary,user,refresh=True)
             if path=='/new':
                 if user['role']!='student':return self.send_page('Access denied',notice('Only students can submit claims.','error'),user,403)
                 return self.send_page('Submit reimbursement',new_claim_form(user),user)
+            confirmation_match=re.fullmatch(r'/(submitted|approved)/(\d+)',path)
+            if confirmation_match:
+                kind,cid=confirmation_match.group(1),int(confirmation_match.group(2))
+                claim=cx.execute('SELECT * FROM claims WHERE id=?',(cid,)).fetchone()
+                if not claim or not accessible(cx,user,claim):
+                    return self.send_page('Not found',notice('Claim not available.','error'),user,404)
+                if kind=='submitted' and (user['role']!='student' or claim['student_id']!=user['id']):
+                    return self.send_page('Access denied',notice('Only the submitting student can open this confirmation.','error'),user,403)
+                if kind=='approved' and user['role']!='faculty':
+                    return self.send_page('Access denied',notice('Only the Faculty Advisor can open this confirmation.','error'),user,403)
+                return self.send_page('Submission confirmed' if kind=='submitted' else 'Approval confirmed',confirmation_screen(claim,kind),user)
             if path.startswith('/claim/'):
                 try: claim_id=int(path.split('/')[2])
                 except (IndexError,ValueError):return self.send_page('Not found',notice('Invalid claim ID.','error'),user,404)
@@ -367,6 +488,7 @@ class Handler(BaseHTTPRequestHandler):
                   <dt>Last updated</dt><dd>{esc(claim['updated_at'])}</dd></dl>'''
                 if claim['receipt_file']: body+=f'<p><a href="/receipt/{claim_id}" target="_blank">View uploaded receipt: {esc(claim["receipt_name"])}</a></p>'
                 else:body+='<p>No receipt was attached.</p>'
+                body+='<section class="claim-progress-panel"><h2>Approval progress</h2>'+progress_tracker(claim)+'</section>'
                 body+=timeline(cx,claim)
                 csrf=f'<input type="hidden" name="csrf" value="{esc(user["csrf"])}"><input type="hidden" name="version" value="{claim["version"]}">'
                 if user['role']=='student' and claim['student_id']==user['id'] and claim['status']=='returned':
@@ -423,6 +545,19 @@ class Handler(BaseHTTPRequestHandler):
         path=urllib.parse.urlsplit(self.path).path
         data=parse_request(self)
         with connect() as cx:
+            if path=='/demo-login':
+                if not DEMO_MODE:
+                    return self.send_page('Unavailable',notice('Demo quick login is disabled.','error'),status=403)
+                selected=str(data.get('role',''))
+                credentials={'student':'student@demo.local','faculty':'faculty@demo.local'}
+                if selected not in credentials:
+                    return self.send_page('Request error',notice('Unknown demo role.','error'),status=400)
+                row=cx.execute('SELECT * FROM users WHERE email=?',(credentials[selected],)).fetchone()
+                if not row: return self.send_page('Unavailable',notice('Demo account was not found.','error'),status=500)
+                token=secrets.token_urlsafe(32)
+                cx.execute('INSERT INTO sessions VALUES(?,?,?,?)', (hashlib.sha256(token.encode()).hexdigest(),row['id'],secrets.token_urlsafe(24),int(time.time())+8*3600))
+                cx.commit()
+                return self.redirect('/',f'sid={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800')
             if path=='/login':
                 row=cx.execute('SELECT * FROM users WHERE email=?',(str(data.get('email','')).lower().strip(),)).fetchone()
                 if not row or not valid_password(str(data.get('password','')),row['password_hash']):
@@ -455,7 +590,7 @@ class Handler(BaseHTTPRequestHandler):
                 cid=cur.lastrowid
                 cx.execute('INSERT INTO events(claim_id,actor_id,action,detail,happened_at) VALUES(?,?,?,?,?)',
                            (cid,user['id'],'Submitted','Claim sent to Faculty Advisor for review.',now))
-                cx.commit();return self.redirect(f'/claim/{cid}')
+                cx.commit();return self.redirect(f'/submitted/{cid}')
             match=re.fullmatch(r'/(decide|resubmit|pay)/(\d+)',path)
             if match:
                 action,cid=match.group(1),int(match.group(2))
@@ -505,7 +640,10 @@ class Handler(BaseHTTPRequestHandler):
                                ('paid',now,ref,now,cid))
                     cx.execute('INSERT INTO events(claim_id,actor_id,action,detail,happened_at) VALUES(?,?,?,?,?)',
                                (cid,user['id'],'Marked Paid','Fictional payment recorded. '+ref,now))
-                cx.commit();return self.redirect(f'/claim/{cid}')
+                cx.commit()
+                if action=='decide' and decision=='approve' and user['role']=='faculty':
+                    return self.redirect(f'/approved/{cid}')
+                return self.redirect(f'/claim/{cid}')
             return self.send_page('Not found',notice('Action not found.','error'),user,404)
 
 
